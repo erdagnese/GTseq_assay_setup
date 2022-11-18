@@ -1,0 +1,100 @@
+---
+title: "SNP_Primer_selection"
+output: html_document
+date: "2022-11-17"
+---
+This script is meant to be used after BatchPrimer3 SNP picking from the fasta created by bedtools. make sure to rename and save as a csv
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load libraries}
+library(here)
+
+```
+
+BatchPrimer3 only allows 500 Seqs at a time, so we have 6 batches of primer sets to import
+```{r data import}
+B1 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch1_BP3.csv"), header = T)
+B2 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch2_BP3.csv"), header = T)
+B3 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch3_BP3.csv"), header = T)
+B4 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch4_BP3.csv"), header = T)
+B5 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch5_BP3.csv"), header = T)
+B6 <- read.csv(here("Seal_ID_SNP_panel","SNPbatch6_BP3.csv"), header = T)
+```
+
+
+```{r}
+library(tidyverse)
+library(stringr)
+```
+We want all of the SNPs in one DF
+
+```{r}
+Primers <- rbind(B1,B2,B3,B4,B5,B6)
+# so there are 1984 total SNPs to choose from
+
+```
+
+We need better names for the primers so we know they are harbor seals
+```{r}
+Primers %>%
+  separate(col = Seq.ID, into = c("g","db","PrimerID"), sep = "\\|") %>%
+  select(!(g:db)) -> Primers
+
+Primers$PrimerID <- str_replace(Primers$PrimerID, "rs", "Pv")
+
+```
+
+We want to be sure to include the ones that were shared between the Pacific dataset and the Salish Sea seal data
+```{r}
+Pac_SS <- read.csv(here("SNPs_inboth_SS_Pac.csv"), header = T)
+
+Pac_SS %>%
+  mutate(Pv = "Pv") %>%
+  unite("PrimerID", sequence, position, sep="_") %>%
+  unite("PrimerID", Pv, PrimerID, sep = "") -> Pac_SS
+
+# pull out the ones that are in both
+keep <- inner_join(Pac_SS, Primers, by = "PrimerID")
+# 22 of 28 had primers created by BatchPrimer3, so we need to keep those, and 2 for the sex ratio so 24 F/R primer sets to order are for sure. So 744 more sets to choose for 8 96well plates
+
+Primers2 <- anti_join(Primers, keep, by = "PrimerID")
+
+Primers2 %>%
+  filter(Orientation == "FORWARD") -> Forward
+Primers2 %>% 
+  filter(Orientation == "REVERSE") -> Reverse
+```
+
+So for the rest we need to randomly select 744 of the 1963 remaining sets
+```{r}
+Forward %>%
+  mutate(PrimNum = 1:n()) %>%
+  mutate(direction = "F") -> Forward
+Reverse %>%
+  mutate(PrimNum = 1:n()) %>%
+  mutate(direction = "R")-> Reverse
+
+rbind(Forward,Reverse) -> Primers3
+Primers3 %>%
+  arrange(PrimNum) -> Primers3
+
+RandV <- sample(1:1963, 744, replace = F)
+
+Primers3 %>%
+  subset(PrimNum %in% RandV) -> RandomSelect
+
+RestPrim <- anti_join(Primers3, RandomSelect)
+
+write.csv(RestPrim, "PrimersNotSelected.csv", row.names = F)
+
+RandomSelect %>%
+  unite("PrimerName", PrimerID, direction) -> Primers4
+
+write.csv(Primers4, "PrimersForOrdering.csv", row.names = F)
+```
+
+Use the template from WDFW to use their excel sheet to add the adapters to the primers and then port them into the ordering sheet

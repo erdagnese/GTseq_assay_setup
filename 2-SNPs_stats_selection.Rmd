@@ -1,0 +1,554 @@
+---
+title: "SNPs_stats"
+output: html_document
+date: "2022-10-11"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load packages}
+library(here)
+```
+ This is post processing in python of the beagle file using the function gprobshwe.jar found on  https://faculty.washington.edu/browning/beagle_utilities/utilities.html#gprobsmetrics
+ 
+```{r import the SNP stats produced by beagle}
+
+SNPstats <- read.table(here("world_beagle_SNP_stats"), header = T)
+SNPs <- read.table(here("Seal_ID_SNP_panel", "Mod_world.extra2.r2.txt"), header = T) # this was saved as a text in VS code
+GbMD <- read.csv(here("Seal_ID_SNP_panel", "world.bamlist.info.csv"), header = T)
+
+PacStats <- read.table(here("pacific_beagle_SNP_stats"), header = F)
+PacSNPs <- read.table(here("Seal_ID_SNP_panel", "mod_pacific_pv_snps.txt"), header = T)
+PacMD <- read.csv(here("Seal_ID_SNP_panel", "pac_metadata.csv"), header = T)
+
+```
+
+```{r}
+library(tidyverse)
+```
+We need to add in the a column to the metadata with Ind0, Ind1 etc matched with the sample IDs so we can bind the metadata to the SNPs data
+```{r dataframe formatting}
+IDls <- colnames(PacSNPs)
+IDls[-c(1,2,3)] -> IDls
+
+IDdf <- as.data.frame(IDls)
+
+IDdf %>% extract(IDls, c("ID", "prop"), "([[:alnum:]]+).([[:alnum:]]+)") %>%
+  filter(prop == 1) %>%
+  select(ID) %>%
+  filter(ID != "In") %>%
+  filter(ID != "Ind") -> AltIDs
+
+PacMeta <- bind_cols(PacMD,AltIDs)
+# okay our metadata has both the real name of the sample and the ANGSD name given to map
+# let's make a long form tibble of the snps to modify the names
+
+PacSNPs %>%
+  pivot_longer(cols = starts_with("Ind"),
+               names_to = "sample",
+               #names_prefix = "Ind",
+               values_to = "ratio") -> PacSNPsLong
+
+PacSNPsLong %>%
+  mutate(ID=sapply(strsplit(PacSNPsLong$sample, split=".", fixed=TRUE), function(x) (x[1]))) -> PacSNPsLong
+
+PacMerge <- merge(PacSNPsLong, PacMeta, by= "ID")
+```
+
+
+
+So we have the SNPs aka markers with all the stats that go with that and we have the genotype likelihood file with the allele likelihoods for all the SNPs and all are in reference to scaffold from the reference genome for Pv
+
+let's look at the breakdown of the stats for each SNP in the global dataset
+```{r SNP filtering from global dataset}
+# pull out those with an R-squared larger than 0.5
+SNPstats %>%
+  filter(allelic.r2 > 0.5) -> SNPs50
+# that reduced it down to 7838 SNPs so that is good
+
+# pull out ones that have a minor allele freq above 0.3 so they are prevalent enough in the pop
+SNPs50 %>% 
+  filter(minorallelefreq > 0.3) -> SNPs50_03
+# that only removed 2 SNPs but now we possible SNPs across all harbor seals which display genetic variation between all seals
+
+# lets merge these with the SNPs with the sample info so we can then sort by metadata
+left_join(SNPs50_03, SNPs) -> SNPs_filtered
+# now we have the genotype likelihoods with the SNP stats for all the 7836 SNPs we can select from
+
+
+```
+
+Do the same for the pacific dataset
+```{r filtering SNPs from pacific dataset}
+# first we need to rename the columns
+PacStats %>%
+  rename(marker = V1) %>%
+  rename(minorallele = V2) %>%
+  rename(minorallelefreq = V3) %>%
+  rename(allelic.r2 = V4) %>% 
+  rename(dosage.r2 = V5) %>%
+  rename(HWE.r2 = V6) %>%
+  rename(accuracy = V7) %>%
+  rename(missing = V8) -> PacStats
+
+# check the minor allele frequency is all above 5%, if not remove it
+PacStats %>% 
+  filter(minorallelefreq > 0.05) -> PacSNPsMAF05
+# so that didn't remove any, so all minor alleles in this data set with a high r2 have a MAF of at least 5%, likely means they were removed in processing before getting to me
+
+# pull out ones that have a minor allele freq (MAF) above 10% and less than 30% so they are prevalent enough in the pop (10%) but not so prevalent that the 
+PacStats %>% 
+  filter(minorallelefreq > 0.1) -> PacSNPs10
+# that reduced the SNPs to 7716 so that is good
+
+PacStats %>%
+  filter(minorallelefreq > 0.25) -> PacSNPs25
+
+# pull out those with an accuracy 
+PacSNPs10 %>%
+  filter(allelic.r2 > 0.5) -> PacSNPs50
+# that reduced it down to  SNPs so that is good
+
+# filter our monomorphic markers which are assigned r-squared values of 0, accuracy and missing score of 1, so let's make a 10% cushion so we are more conservative
+PacSNPs25 %>%
+  filter(accuracy < 0.9) %>%
+  filter(missing < 0.9) %>%
+  filter(allelic.r2 > 0.1) -> PacSNPs25_filt
+# okay that is still 8914 SNPs so that's a lot but more manageable than 17k  
+# so let's move forward with this 25% MAF and no monomorphic markers filtered set
+
+# that removed quite a few SNPs, now there are 3978 left
+
+
+
+# lets merge these with the SNPs with the sample info so we can then sort by metadata
+left_join(PacSNPs25_filt,PacSNPs) -> PacSNPs_filtered
+# now we have the genotype likelihoods with the SNP stats for all the 7836 SNPs we can select from
+```
+
+let's find the SNPs that are shared and the ones that only in the pacific seals to pull from
+```{r SNP detection by population}
+semi_join(PacSNPs_filtered, SNPs_filtered, by = "marker") -> both_filtered
+
+anti_join(PacSNPs_filtered, SNPs_filtered, by = "marker") -> PacOnly_filtered
+
+# let's make a column with the marker and one with the position so we - the goal is to create a list of markers and SNP positions and a list of start and end positions to extract and put into a fasta file to then use in Batch Primer3
+
+PacOnly_filtered %>%
+  mutate(sequence1 =sapply(strsplit(PacOnly_filtered$marker, split="_", fixed=TRUE), function(x) (x[1]))) %>%
+  relocate(sequence1, .before = minorallele) %>%
+    mutate(sequence2 =sapply(strsplit(PacOnly_filtered$marker, split="_", fixed=TRUE), function(x) (x[2]))) %>%
+  relocate(sequence2, .before = minorallele) %>%
+  mutate(position =sapply(strsplit(PacOnly_filtered$marker, split="_", fixed=TRUE), function(x) (x[3]))) %>%
+  relocate(position, .before = minorallele) %>%
+  unite(sequence, c(sequence1, sequence2), sep = "_", remove = TRUE) -> PacMAFFiltered
+
+# let's see how many SNPs are on each marker
+table(PacMAFFiltered$sequence) -> count_per_seq
+count_per_seq <- as.data.frame(count_per_seq)
+# the most are in seq NW_022589705.1 with 484, then the second most are in NW_022589704.1 with 318, these are both the longest sequences in the scaffold with over 100Mbp so that makes sense
+
+head(count_per_seq, n=15)
+
+```
+
+
+Alright so now we know where all the SNPs are that we may want to develop primers for. Let's create a column with start and one fro end bp locations for each marker, then create a bed file with chromosome position position 
+
+```{r name creation for fasta}
+# let's add 100 bp on either side so that the fasta file is 201 bp and batch primer3 will have options to make the region 75-100 bp long around that position
+# first make position a numeric variable
+PacMAFFiltered$position <- as.numeric(PacMAFFiltered$position)
+
+PacMAFFiltered %>%
+  mutate(start = position-100) %>%
+  relocate(start, .before = position) %>%
+  mutate(end = position+100) %>%
+  relocate(end, .before = position) %>%
+  mutate(newPosition = end-position) %>% # creating a new column that has the position of the SNP inside the start and end of the region for primers
+  relocate(newPosition,.before = position) %>%
+  mutate(refBP = case_when(allele1 == 0 ~ "A", 
+                           allele1 == 1 ~ "C",
+                           allele1 == 2 ~ "G",
+                           allele1 == 3 ~ "T")) %>% # recodes the allele1 and 2 as their BPs
+  relocate(refBP, .before = minorallele) %>%
+  mutate(minorBP = case_when(allele2 == 0 ~ "A", 
+                           allele2 == 1 ~ "C",
+                           allele2 == 2 ~ "G",
+                           allele2 == 3 ~ "T")) %>%
+  relocate(minorBP, .before = minorallele) -> PacSNPplace
+
+# we need to create a name character that matches what should be in the final fasta
+# should look something like this 
+#>gnl|dbSNP|rs16821171 
+#>#rs=16821171|pos=187|len=613|taxid=10090|mol="genomic"|class=1|alleles="A/G"|build=123
+# use this legend https://www.ncbi.nlm.nih.gov/projects/SNP/snp_legend.cgi?legend=fasta
+# so we need a column that has a name created for each SNP that reads: >gnl|dbSNP|rsSequence|pos=1+pos in new  
+
+PacSNPplace %>%
+  select('sequence','start','end','position','marker','newPosition','refBP','minorBP') -> tmpPCRprimer
+  
+tmpPCRprimer %>%
+  mutate(gnl = "gnl") %>%
+  mutate(dbSNP = "dbSNP") %>%
+  mutate(rs1 = "rs") %>%
+  mutate(marker2 = marker) %>%
+  unite("marker", rs1, marker, sep = "") %>%
+  mutate(rs = "rs") %>%
+  unite("rs", rs,marker2, sep = "=") %>%
+  mutate(len = "len=200") %>%
+  mutate(taxaid = "taxaid=9720") %>%
+  mutate(mol = 'mol="genomic"') %>%
+  mutate(pos = "pos=100") %>%
+  mutate(class = "class=1") %>%
+  unite("alleles", refBP, minorBP, sep = "/") -> PacSNPs
+  
+PacSNPs$alleles <- paste0('"', PacSNPs$alleles, '"')  
+
+PacSNPs %>%
+  mutate(allele2 = 'alleles=') %>%
+  unite("allele", allele2,alleles, sep = "") %>%
+  mutate(build = "build=123") %>%
+  unite("name1", gnl,dbSNP,marker, sep = "|") %>%
+  unite("name2", rs,pos,len,taxaid,mol,class,allele,build, sep = "|") %>%
+  unite("name", name1,name2, sep = "
+        ")-> PacSNPs1
+
+
+PacSNPs1 %>%
+  select('sequence','start','end','name') -> bed2
+
+# if there are some negative values in the start position let's just remove those so we don't have to figure out where the new position is
+bed2 %>%
+ filter(start > 0) -> bed2
+
+# now make the bed file to then use in the python script in bedtools
+colnames(bed2) <- c('chrom', 'chromStart', 'chromEnd', 'name')
+write.table(bed2, "pacific_seals.bed", sep = '\t', row.names = F, quote = F, col.names = F)
+
+# yahoo that worked and created a fasta with the bedtools script
+
+```
+
+
+Now we need to read in the metadata once we have it so we can do the following:
+1) merge the population location info with the SNPs data
+2) Run a PCA by population
+3) find SNPs which are variable within the region 
+4) randomly select from those to design primers for
+
+Now we also need to design SNPs off the variant calls from Dietmar, so need to use the seal.vcf file imported
+* NOTE: may need to further process in VCFtools before we can pipe them into R.
+
+For Nathans data from Dietmar that is in a VCF format lets use a package which handles VCF files, this was created by freebayes software from RADseq data from fecal samples from ~15 seals in the Salish sea
+```{r VCF file to tidy dataframe}
+#install.packages("vcfR")
+library(vcfR)
+
+# we filtered out only the dbSNPs so there are no INDELs left in the dataset and filtered out some low quality and low depth reads in VCFtools script Seal_SS_test_SNP_filter.py, so we will use that .vcf output here to see how many are left
+SS_SNPS <- read.vcfR(here("Seal_ID_SNP_panel","snps40maf40.recode.vcf"), verbose = FALSE )
+chromMap <- read.table(here("Seal_ID_SNP_panel", "chr_name_conv.txt"), sep='\t', header = TRUE)
+chromMap %>%
+  rownames_to_column(var= "CHROM") %>%
+  rename(refseq = contig..chromosome) -> chromMap
+# we will map these to the VCF dataframe later
+
+vcf_field_names(SS_SNPS, tag = "FORMAT") #prints VCF to make sure import worked
+
+SS_snp_df <- vcfR2tidy(SS_SNPS, info_only = TRUE)
+# vcfR2tidy(x,info_only = FALSE,single_frame = FALSE,toss_INFO_column = TRUE,...)
+
+# this actually pulls our the data into a dataframe so we can identify the positions on the chromosomes 
+SS_snp_df$fix -> SSsnptidy
+
+
+# alright annoyingly in the mapping file the RXNX contigs don't have a .1 at the end like in the vcf file chrom so now we have to modify the mapping file a tad
+
+chromMap %>%
+  filter(str_detect(CHROM, "RXNX")) -> mapfix
+
+anti_join(chromMap, mapfix) -> restmap
+
+mapfix$CHROM <- paste(mapfix$CHROM, "1", sep=".")
+# okay so now we need to replace the old values
+
+rbind(restmap, mapfix) -> chromMap
+
+# let's joing them now
+left_join(SSsnptidy, chromMap) -> SSsnptidyMap
+
+
+SSsnptidyMap %>%
+  relocate(refseq, .before = CHROM) -> SSsnptidyMap
+
+# okay now we have the right name associated with the SNPs
+
+
+```
+
+Filtering the SNPs
+```{r SNP filtering by quality and depth again}
+library(DescTools)
+# okay so let's set the quality cutoff at 50 
+SSsnptidyMap %>%
+  filter(QUAL >=50) -> SSQ50
+#that removed about 90 snps, good, let's now set a depth threshold to remove some others with low depth across samples
+SSQ50 %>%
+  filter(DP >= 50) -> SSQ50DP50
+# okay we are down to 3997 SNPs to choose from now, still quite a few so perhaps we need to find ones that are close to each other in case there are microhaplotypes to look for
+
+# try with group_by and filter
+SSQ50DP50 %>%
+  select(refseq,POS) -> tmp
+tmp %>% mutate_at(vars(-refseq), funs(as.numeric(as.character(.))))
+```
+We now have a dataframe with each SNP on which contig/marker.
+Next we are going to calculate the difference between consecutive values and create a dataframe of SNPs whicha re more than 100 bp away from another SNP and ones that are within that to look for potential microhaplotypes to choose
+
+```{r SNP filtering by distance to other SNPs}
+tmp %>%
+  group_by(refseq) %>% # group by contig/marker
+  mutate(diffPrev = POS - lag(POS)) %>% # add a column with difference between SNP and prev
+  mutate(diffNxt = lead(POS) - POS) -> SNPsDiff # add a column with difference between SNP and next SNP and create the dataframe to use moving forward
+
+SNPsDiff %>%
+  filter(diffPrev > 100 & diffNxt > 100) -> SNPs100  # only keep SNPs which have a difference between prev SNPs that are more than 100 bp from another SNP
+#have 2930 SNPs which are more than 100 bp apart from another SNP so these we will get all the surrounding seqs for to put into batch primer3 - these are ones that have a MAF above 40%
+
+SNPsDiff %>%
+  filter(diffPrev < 5 | diffNxt < 5) -> SNPsHaps # 142 SNPs which are within 5 bp of another SNP 
+# these we need to go through and find one SNP in the region to assign as the one to make the primer set based off of (choose the middle one or the first one in a series of 2)
+
+```
+
+
+
+Take the single SNPs and select out ones on markers that are shorter and there aren't many SNPs on them
+
+```{r SNP filtering by contig}
+SNPs100 %>% select(refseq,POS) -> SNP100ls
+
+SNP100ls %>% # that selects out only columns we need
+  group_by(refseq) %>% # group by marker/contig
+   summarise(maximum = max(POS),
+        minimum = min(POS)) %>%
+  mutate(range = maximum - minimum)-> rangeSNP100
+# let's remove the markers where there are less than 10k bp range in the SNP positions
+
+rangeSNP100 %>%
+  filter(range >= 10000) -> range10kSNP100 # okay kept 99 of 112 markers
+
+# let's only keep the positions on the markers list we just made and make it a vector to use to filter SNP positions
+dplyr::pull(range10kSNP100,refseq) -> markersV
+
+SNP100ls %>%
+  subset(refseq %in% markersV) -> SNPsubset # still have 2908 SNPs
+
+# let's count how many SNPs are on each marker we have left
+SNPsubset %>%
+  group_by(refseq) %>%
+  summarise(n=n()) -> SNPcount
+# there is a range of SNP counts on markers from 2 SNPs to 213 SNPs/marker
+# so let's remove ones that have less than 10 SNPs on a marker
+
+SNPcount %>%
+  filter(n >= 10) -> SNPcount2 # now we are down to 79 markers, but that won't have removed many SNPs
+dplyr::pull(SNPcount2,refseq) -> markers2V
+
+SNPsubset %>%
+  subset(refseq %in% markers2V) -> SNPsubset2 # 2776 SNPs left
+
+```
+Okay so we have 2776 SNPs that are at least 100 bp away from another SNP, and have at least a 40% MAF, a depth of 50% across samples, and a quality score of at least 50 and a max-missing of 40%, and a minor allele count of 2. These we will get into batch primer3
+
+
+STOP: Only run next chunk if we decide to move MAF cutoff down to 30% rather than 40% 
+```{r}
+# Let's do another one were we remove markers with less than 50 and 100 SNPs/marker
+SNPcount %>%
+  filter(n >= 50) -> SNPcount3 # 27 markers retained
+
+dplyr::pull(SNPcount3,refseq) -> markers3V
+
+SNPsubset %>%
+  subset(refseq %in% markers3V) -> SNPsubset3 # okay down to 2212 SNPs across 27 markers
+
+
+SNPcount %>%
+  filter(n >= 100) -> SNPcount4 # 6 markers retained
+
+dplyr::pull(SNPcount4,refseq) -> markers4V
+
+SNPsubset %>%
+  subset(refseq %in% markers4V) -> SNPsubset4 # okay down to 823 SNPs across 6 markers all markers have at least 100 SNPs
+
+
+```
+
+We are going to check the haplotypes to select out one of the SNPs to assign as the SNP for primer design
+```{r SNP haplotype selection}
+# ad a observation number for that contig
+# we need to find a way to assign a microhap id number to group_by to slice at the median if more than 2 are present in a row
+
+SNPsHaps %>%
+  group_by(refseq) %>%
+  mutate(hapID = cumsum(c(TRUE,diff(as.numeric(POS)) > 5))) -> MicroHaps
+# now we need to add a value for the position's bp order in the microhap
+MicroHaps %>%
+  group_by(refseq,hapID) %>%
+  mutate(order= 1:n()) -> MicroHaps
+# now we have microhaps identified on each contig, in order and where each SNP falls in the order
+# let's pull out the ones that have more than 2 SNPs in the microhap and then call the median row information only to add to the list to find primers for
+MicroHaps %>%
+  count(refseq,hapID) -> CountHaps
+
+MicroHaps %>% inner_join(CountHaps, b=c("refseq","hapID")) -> Microhaps2
+Microhaps2 %>% 
+  filter(n > 2) -> MultiBPhaps
+Microhaps2 %>% # next let's pull out the ones that only have two SNPs in each and call the 1st BP
+  filter(n == 2) %>%
+  filter(order == 1) -> SNPin2bphap # these ones will be added to the list from SNPsubset 2 ATTENTION
+
+MultiBPhaps %>%
+  group_by(refseq,hapID) %>%
+  filter(row_number()==ceiling(n()/2)) %>%
+  ungroup()-> SNPinXBPhaps
+# this halves the the nrow of the group, ceiling rounds up decimals for odd values
+
+# bind the two to keep track of which ones were microhaps for downstream analysis 
+MicroHapsSNPs <- rbind(SNPinXBPhaps,SNPin2bphap)
+
+write.csv(MicroHapsSNPs, "Microhaplotypes_SNPs_used.csv", row.names = FALSE)
+# I also want to find the Ref and Alt alleles for all the bp in the microhaplotypes
+Microhaps2 %>%
+  select(refseq,POS) -> AllHaplotypePOS
+
+inner_join(AllHaplotypePOS,SSQ50DP50, by=c("refseq","POS")) -> MicrohapsData
+write.csv(MicrohapsData, "All_Microhaplotype_BP_data.csv", row.names = FALSE)
+
+MicroHapsSNPs %>%
+  select(refseq,POS) -> MicrohapList
+
+```
+
+Now we are going to combine the SNPs and the Microhaplist into one dataframe, and innerjoin to pull out all the data we need to make the fasta file
+```{r create dataframe with info for primer design}
+rbind(MicrohapList, SNPsubset2) -> ALLSNPsList # 2843 SNPs to design primers for
+
+inner_join(ALLSNPsList, SSQ50DP50, by = c("refseq","POS")) -> AllSNPsData
+
+AllSNPsData %>%
+  select(refseq,POS,REF,ALT) -> FINALSNPsData
+
+```
+
+Alright, now we have a list of 2843 SNPs from the seal scat samples to find the sequence data for, time to make the bed file like above
+```{r}
+FINALSNPsData%>%
+  mutate(start = POS-100) %>%
+  relocate(start, .before = POS) %>%
+  mutate(end = POS+100) %>%
+  relocate(end, .before = POS) %>%
+  mutate(newPosition = end-POS) %>% # creating a new column that has the position of the SNP inside the start and end of the region for primers
+  relocate(newPosition,.before = POS) %>%
+  mutate(marker = refseq) %>%
+  unite("indmarker", marker, POS, sep="_") -> SSSNPplace
+
+
+# we need to create a name character that matches what should be in the final fasta
+# should look something like this 
+#>gnl|dbSNP|rs16821171 
+#rs=16821171|pos=187|len=613|taxid=10090|mol="genomic"|class=1|alleles="A/G"|build=123
+# use this legend https://www.ncbi.nlm.nih.gov/projects/SNP/snp_legend.cgi?legend=fasta
+
+
+SSSNPplace %>%
+  mutate(gnl = "gnl") %>%
+  mutate(dbSNP = "dbSNP") %>%
+  mutate(rs1 = "rs") %>%
+  mutate(marker = refseq) %>%
+  mutate(marker2 = marker) %>%
+  unite("marker", rs1, indmarker, sep = "") %>%
+  mutate(rs = "rs") %>%
+  unite("rs", rs,marker2, sep = "=") %>%
+  mutate(len = "len=200") %>%
+  mutate(taxaid = "taxaid=9720") %>%
+  mutate(mol = 'mol="genomic"') %>%
+  mutate(pos = "pos=100") %>%
+  mutate(class = "class=1") %>%
+  mutate(ref = REF) %>%
+  mutate(alt = ALT) %>%
+  unite("alleles", REF, ALT, sep = "/") -> SNPsformat
+  
+SNPsformat$alleles <- paste0('"', SNPsformat$alleles, '"')  
+
+SNPsformat %>%
+  mutate(allele2 = 'alleles=') %>%
+  unite("allele", allele2,alleles, sep = "") %>%
+  mutate(build = "build=123") %>%
+  unite("name1", gnl,dbSNP,marker, sep = "|") %>%
+  unite("name2", rs,pos,len,taxaid,mol,class,allele,build, sep = "|") %>%
+  unite("name", name1,name2, sep = ' ')-> SNPsformat1
+
+
+SNPsformat1 %>%
+  select('refseq','start','end','name') -> bed
+
+# if there are some negative values in the start position let's change those to 1's (so they will be slightly shorter but only by max of 8 bp shorter)
+# bed[bed < 0] <- 1
+
+# now make the bed file to then use in the python script in bedtools
+colnames(bed) <- c('chrom', 'chromStart', 'chromEnd', 'name')
+write.table(bed, "SalishSea_seals.bed", sep = '\t', row.names = F, quote = F, col.names = F)
+
+# yahoo that worked and created a fasta with the bedtools script
+```
+
+We want to see if there are any SNPs that are in both the Pacific dataset and the Salish Sea seal, there likely won't be, but should check to be sure
+```{r}
+# need to modify them so the formats match
+PacSNPs %>%
+  select(sequence,position) -> PacSNPscheck
+
+FINALSNPsData %>%
+  select(refseq, POS) %>%
+  rename(sequence = refseq) %>%
+  rename(position = POS) -> SalSNPscheck
+
+semi_join(SalSNPscheck, PacSNPscheck, by = c("sequence","position")) -> SalPacBoth
+
+write.csv(SalPacBoth, "SNPs_inboth_SS_Pac.csv", row.names = F)
+
+# there are 28 SNPs that are in both datasets, so we need to make sure those ones get kept in final primer set
+
+```
+
+So we are going to take the Salish Sea bed file and make a fasta to put into batch primer3 using bedtools_flankingSeqs.py script
+
+
+Important step after getting the fasta output is to alter it by changing the Allele bp to the right degeneracy so we need to make a position file with tabs as delimiter
+```{r}
+SNPsformat1 %>%
+  select(name,newPosition,ref,alt) %>%
+  mutate(deg = case_when(ref == "A" & alt == "G" ~ "R",
+                         ref == "G" & alt == "A" ~ "R",
+                         ref == "C" & alt == "T" ~ "Y", 
+                         ref == "T" & alt == "C" ~ "Y",
+                         ref == "A" & alt == "C" ~ "M",
+                         ref == "C" & alt == "A" ~ "M",
+                         ref == "G" & alt == "T" ~ "K",
+                         ref == "T" & alt == "G" ~ "K",
+                         ref == "G" & alt == "C" ~ "S",
+                         ref == "C" & alt == "G" ~ "S",
+                         ref == "A" & alt == "T" ~ "W",
+                         ref == "T" & alt == "A" ~ "W")) %>%
+  select(name, newPosition, deg) -> SNPposdf
+
+colnames(SNPposdf) <- c('CHROM', 'POS', 'REF', 'ALT')
+write.table(SNPposdf, "SalishSea_SNPsPosition.txt", sep = '\t', row.names = F, quote = F, col.names = F)
+```
+
+Use the outputs from this in the bedtools script. 
